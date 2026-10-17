@@ -3,6 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import {
   Address,
   Contract,
+  FeeBumpTransaction,
   Keypair,
   nativeToScVal,
   scValToNative,
@@ -37,6 +38,18 @@ export interface OnChainEvent {
   maxResaleMultiplierBps: number;
   royaltyBps: number;
   ticketsIssued: bigint;
+}
+
+/** A ticketing-contract event the chain indexer applies (#163). */
+export interface ChainTicketEvent {
+  /** RPC event id; unique per emitted event, so it dedupes re-delivery. */
+  id: string;
+  pagingToken: string;
+  ledger: number;
+  /** Event topic, e.g. `TicketIssued` or `TicketCheckedIn`. */
+  name: string;
+  /** Ticket the event refers to, or null when the payload carries none. */
+  chainTicketId: bigint | null;
 }
 
 /** The single ticketing-contract call carried by a signed envelope. */
@@ -80,6 +93,19 @@ const MAX_SUBMIT_RETRIES = 3;
 /** #384 — Initial backoff delay in ms when retrying TRY_AGAIN_LATER. */
 const INITIAL_SUBMIT_BACKOFF_MS = 1_000;
 
+/**
+ * Default ceiling on the platform-paid fee for one sponsored attendee
+ * transaction, in stroops (100_000 = 0.01 XLM). Override with
+ * FEE_BUMP_MAX_FEE_STROOPS.
+ */
+const DEFAULT_FEE_BUMP_MAX_FEE_STROOPS = 100_000;
+
+/** Options for `submitSignedTransaction`. */
+export interface SubmitOptions {
+  /** Wrap the envelope in a platform-funded fee bump (#161). Off by default. */
+  sponsorFee?: boolean;
+}
+
 @Injectable()
 export class StellarService {
   private readonly logger = new Logger(StellarService.name);
@@ -90,6 +116,7 @@ export class StellarService {
   private readonly platformSigner: Keypair;
   private readonly buildTxTimeoutSeconds: number;
   private readonly pollTimeoutSeconds: number;
+  private readonly feeBumpMaxFeeStroops: number;
   private readonly rpcCircuitBreaker = new CircuitBreaker();
   private platformAccountCache: {
     account: Awaited<ReturnType<rpc.Server['getAccount']>>;
@@ -114,6 +141,9 @@ export class StellarService {
     this.pollTimeoutSeconds =
       this.config.get<number>('TRANSACTION_POLL_TIMEOUT_SECONDS') ??
       DEFAULT_POLL_TIMEOUT_SECONDS;
+    this.feeBumpMaxFeeStroops =
+      this.config.get<number>('FEE_BUMP_MAX_FEE_STROOPS') ??
+      DEFAULT_FEE_BUMP_MAX_FEE_STROOPS;
 
     this.logger.log(
       `StellarService initialized: networkPassphrase='${this.networkPassphrase}', contractId='${this.contractId}'`,
@@ -283,8 +313,11 @@ export class StellarService {
    */
   async submitSignedTransaction(
     signedXdr: string,
+    options: SubmitOptions = {},
   ): Promise<{ result: unknown; txHash: string }> {
-    const tx = TransactionBuilder.fromXDR(signedXdr, this.networkPassphrase);
+    const tx = options.sponsorFee
+      ? this.sponsorFee(signedXdr)
+      : TransactionBuilder.fromXDR(signedXdr, this.networkPassphrase);
     const txHash = tx.hash().toString('hex');
 
     let sendResult: rpc.Api.SendTransactionResponse | undefined;
@@ -343,6 +376,68 @@ export class StellarService {
    * a single `invokeHostFunction` call on the configured contract — the only
    * shape `build*Tx` ever produces.
    */
+  /**
+   * Hex hash of the wallet-signed envelope. Stable for a given envelope, so
+   * it identifies a confirm request across replays (#159).
+   */
+  txHashOf(signedXdr: string): string {
+    return TransactionBuilder.fromXDR(signedXdr, this.networkPassphrase)
+      .hash()
+      .toString('hex');
+  }
+
+  /**
+   * #161 — wraps the attendee's signed envelope in a fee bump the platform
+   * pays for. The declared fee is the spending cap: the network charges only
+   * what the inner transaction actually needs, never more than the cap.
+   */
+  private sponsorFee(signedXdr: string): FeeBumpTransaction {
+    const inner = TransactionBuilder.fromXDR(signedXdr, this.networkPassphrase);
+    if (!(inner instanceof Transaction)) {
+      throw new Error('Envelope is already a fee bump');
+    }
+    if (Number(inner.fee) > this.feeBumpMaxFeeStroops) {
+      throw new Error(
+        `Transaction fee ${inner.fee} exceeds the sponsorship cap of ${this.feeBumpMaxFeeStroops} stroops`,
+      );
+    }
+    const feeBump = TransactionBuilder.buildFeeBumpTransaction(
+      this.platformSigner,
+      this.feeBumpMaxFeeStroops.toString(),
+      inner,
+      this.networkPassphrase,
+    );
+    feeBump.sign(this.platformSigner);
+    return feeBump;
+  }
+
+  /**
+   * One page of ticketing-contract events after `cursor`. Without a cursor,
+   * reads from the latest ledger so a first run does not replay history the
+   * RPC node may have pruned (#163).
+   */
+  async getTicketEvents(
+    cursor: string | undefined,
+    limit: number,
+  ): Promise<ChainTicketEvent[]> {
+    const start = cursor
+      ? { cursor }
+      : {
+          startLedger: (await this.rpcCall(() => this.server.getLatestLedger()))
+            .sequence,
+        };
+    const response = await this.rpcCall(() =>
+      this.server.getEvents({
+        ...start,
+        filters: [
+          { type: 'contract', contractIds: [this.contract.contractId()] },
+        ],
+        limit,
+      }),
+    );
+    return response.events.map((event) => this.decodeTicketEvent(event));
+  }
+
   decodeSignedInvocation(signedXdr: string): SignedInvocation {
     const tx = TransactionBuilder.fromXDR(signedXdr, this.networkPassphrase);
     const inner = tx instanceof Transaction ? tx : tx.innerTransaction;
@@ -473,6 +568,24 @@ export class StellarService {
       await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
     }
     throw new Error(`Timed out waiting for transaction ${hash} to land`);
+  }
+
+  private decodeTicketEvent(event: rpc.Api.EventResponse): ChainTicketEvent {
+    const name = String(scValToNative(event.topic[0]));
+    // Payload shape is assumed: a bare u64 ticket id, or a map with a
+    // `ticket_id` field. Confirm against the contract's emitted events.
+    const payload = scValToNative(event.value) as unknown;
+    const raw =
+      typeof payload === 'bigint'
+        ? payload
+        : (payload as { ticket_id?: unknown } | null)?.ticket_id;
+    return {
+      id: event.id,
+      pagingToken: event.pagingToken,
+      ledger: event.ledger,
+      name,
+      chainTicketId: typeof raw === 'bigint' ? raw : null,
+    };
   }
 
   private rpcCall<T>(operation: () => Promise<T>): Promise<T> {
