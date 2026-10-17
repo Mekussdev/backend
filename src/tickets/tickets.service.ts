@@ -8,7 +8,12 @@ import {
   Optional,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { Prisma, ResaleListingStatus, TicketStatus } from '@prisma/client';
+import {
+  EventStatus,
+  Prisma,
+  ResaleListingStatus,
+  TicketStatus,
+} from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { UNASSIGNED_SEAT } from '../common/constants/seat.constant';
 import {
@@ -56,9 +61,11 @@ export class TicketsService {
     await this.organizations.assertMember(event.organizationId, userId);
     this.assertHasCapacity(ticketType.quantityIssued, ticketType.quantityTotal);
     this.assertSaleWindow(ticketType.saleStartsAt, ticketType.saleEndsAt);
-    if (event.chainEventId === null) {
+    if (event.status !== EventStatus.PUBLISHED || event.chainEventId === null) {
       throw new BadRequestException(
-        'Event has not been published on-chain yet',
+        event.status === EventStatus.CANCELLED
+          ? 'Event has been cancelled'
+          : 'Event has not been published on-chain yet',
       );
     }
 
@@ -143,9 +150,11 @@ export class TicketsService {
     const { ticketType, event } =
       await this.getTicketTypeWithEvent(ticketTypeId);
     this.assertHasCapacity(ticketType.quantityIssued, ticketType.quantityTotal);
-    if (event.chainEventId === null) {
+    if (event.status !== EventStatus.PUBLISHED || event.chainEventId === null) {
       throw new BadRequestException(
-        'Event has not been published on-chain yet',
+        event.status === EventStatus.CANCELLED
+          ? 'Event has been cancelled'
+          : 'Event has not been published on-chain yet',
       );
     }
     const buyer = await this.getUserWithWallet(buyerId);

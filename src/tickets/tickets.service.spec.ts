@@ -15,6 +15,7 @@ import {
   ListingInactiveError,
   TicketTypeSoldOutError,
 } from '../common/errors/domain.error';
+import { UNASSIGNED_SEAT } from '../common/constants/seat.constant';
 import { Prisma } from '@prisma/client';
 import { TicketsService } from './tickets.service';
 import type { PrismaService } from '../prisma/prisma.service';
@@ -44,6 +45,7 @@ function buildTicketType(overrides: Partial<Record<string, unknown>> = {}) {
         id: 'event-1',
         organizationId: 'org-1',
         chainEventId: 42n,
+        status: 'PUBLISHED',
       }),
       organization: createOrganization({ stellarAccount: 'GORGANIZER' }),
     },
@@ -178,10 +180,30 @@ describe('TicketsService', () => {
       expect(stellar.buildIssueTicketTx).not.toHaveBeenCalled();
     });
 
-    it('rejects issuing against an unpublished event', async () => {
+    it('rejects issuing against an unpublished event in DRAFT status (400) (#383)', async () => {
       prisma.ticketType.findUnique.mockResolvedValue(
         buildTicketType({
-          event: { ...buildTicketType().event, chainEventId: null },
+          event: {
+            ...buildTicketType().event,
+            status: 'DRAFT',
+            chainEventId: null,
+          },
+        }),
+      );
+
+      await expect(
+        service.buildIssueTx('organizer-1', 'tt-1', 'buyer-1', 'GBUYER'),
+      ).rejects.toBeInstanceOf(BadRequestException);
+    });
+
+    it('rejects issuing against a CANCELLED event even if it has a chainEventId (400) (#383)', async () => {
+      prisma.ticketType.findUnique.mockResolvedValue(
+        buildTicketType({
+          event: {
+            ...buildTicketType().event,
+            status: 'CANCELLED',
+            chainEventId: 42n,
+          },
         }),
       );
 
@@ -226,6 +248,71 @@ describe('TicketsService', () => {
         toPublicKey: 'GBUYER',
         tier: 'GA',
         seat: 'A1',
+        price: 1_000n,
+      });
+    });
+  });
+
+  describe('buildPurchaseTx', () => {
+    it('rejects purchase against a DRAFT event (400) (#383)', async () => {
+      prisma.ticketType.findUnique.mockResolvedValue(
+        buildTicketType({
+          event: {
+            ...buildTicketType().event,
+            status: 'DRAFT',
+            chainEventId: null,
+          },
+        }),
+      );
+      prisma.user.findUnique.mockResolvedValue(
+        createUser({ id: 'buyer-1', stellarPublicKey: 'GBUYER' }),
+      );
+
+      await expect(
+        service.buildPurchaseTx('buyer-1', 'tt-1'),
+      ).rejects.toBeInstanceOf(BadRequestException);
+    });
+
+    it('rejects purchase against a CANCELLED event even if it has a chainEventId (400) (#383)', async () => {
+      prisma.ticketType.findUnique.mockResolvedValue(
+        buildTicketType({
+          event: {
+            ...buildTicketType().event,
+            status: 'CANCELLED',
+            chainEventId: 42n,
+          },
+        }),
+      );
+      prisma.user.findUnique.mockResolvedValue(
+        createUser({ id: 'buyer-1', stellarPublicKey: 'GBUYER' }),
+      );
+
+      await expect(
+        service.buildPurchaseTx('buyer-1', 'tt-1'),
+      ).rejects.toBeInstanceOf(BadRequestException);
+    });
+
+    it('builds purchase_primary transaction against a PUBLISHED event (#383)', async () => {
+      prisma.ticketType.findUnique.mockResolvedValue(
+        buildTicketType({
+          event: {
+            ...buildTicketType().event,
+            status: 'PUBLISHED',
+            chainEventId: 42n,
+          },
+        }),
+      );
+      prisma.user.findUnique.mockResolvedValue(
+        createUser({ id: 'buyer-1', stellarPublicKey: 'GBUYER' }),
+      );
+
+      const result = await service.buildPurchaseTx('buyer-1', 'tt-1');
+      expect(result).toEqual({ unsignedXdr: 'unsigned-xdr' });
+      expect(stellar.buildPurchasePrimaryTx).toHaveBeenCalledWith({
+        buyerPublicKey: 'GBUYER',
+        chainEventId: 42n,
+        tier: 'GA',
+        seat: UNASSIGNED_SEAT,
         price: 1_000n,
       });
     });
@@ -1496,13 +1583,12 @@ describe('TicketsService', () => {
       expect(stellar.submitSignedTransaction).toHaveBeenCalledWith(
         'signed-xdr',
       );
-      expect(prisma.ticket.update).toHaveBeenCalledWith({
-        where: { id: 'ticket-1' },
-        data: expect.objectContaining({
-          status: 'USED',
-          checkedInAt: expect.any(Date),
-        }),
-      });
+      const updateCall = prisma.ticket.update.mock.calls[0] as [
+        { where: { id: string }; data: { status: string; checkedInAt: Date } },
+      ];
+      expect(updateCall[0].where).toEqual({ id: 'ticket-1' });
+      expect(updateCall[0].data.status).toBe('USED');
+      expect(updateCall[0].data.checkedInAt).toBeInstanceOf(Date);
       expect(result.status).toBe('USED');
       expect((result.checkedInAt as Date).getTime()).toBeGreaterThanOrEqual(
         before,

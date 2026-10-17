@@ -18,8 +18,10 @@ import {
 } from '../../test/helpers/stellar-harness';
 import {
   eventScVal,
+  sendDuplicate,
   sendPending,
   sendRejected,
+  sendTryAgainLater,
   simulationError,
   simulationSuccess,
   ticketScVal,
@@ -372,6 +374,63 @@ describe('StellarService (contract-mock harness)', () => {
       await expect(
         service.submitSignedTransaction(await signedIssueEnvelope(service)),
       ).rejects.toThrow(/Soroban submission failed: .*txBAD_SEQ/);
+      expect(server.getTransaction).not.toHaveBeenCalled();
+    });
+
+    it('handles DUPLICATE by polling the existing transaction hash (#384)', async () => {
+      const { service, server } = createStellarHarness();
+      server.sendTransaction.mockResolvedValue(sendDuplicate());
+      server.getTransaction.mockResolvedValue(
+        txSuccess(nativeToScVal(CHAIN_TICKET_ID, { type: 'u64' })),
+      );
+      const signed = await signedIssueEnvelope(service);
+
+      const result = await service.submitSignedTransaction(signed);
+
+      expect(result).toEqual({ result: CHAIN_TICKET_ID, txHash: TX_HASH });
+      expect(server.sendTransaction).toHaveBeenCalledTimes(1);
+      expect(server.getTransaction).toHaveBeenCalledWith(TX_HASH);
+    });
+
+    it('retries TRY_AGAIN_LATER with backoff and succeeds when subsequent attempt returns PENDING (#384)', async () => {
+      const { service, server } = createStellarHarness();
+      const signed = await signedIssueEnvelope(service);
+      jest.useFakeTimers();
+
+      server.sendTransaction
+        .mockResolvedValueOnce(sendTryAgainLater())
+        .mockResolvedValueOnce(sendPending());
+      server.getTransaction.mockResolvedValue(
+        txSuccess(nativeToScVal(CHAIN_TICKET_ID, { type: 'u64' })),
+      );
+
+      const pending = service.submitSignedTransaction(signed);
+      await jest.advanceTimersByTimeAsync(1_000);
+
+      await expect(pending).resolves.toEqual({
+        result: CHAIN_TICKET_ID,
+        txHash: TX_HASH,
+      });
+      expect(server.sendTransaction).toHaveBeenCalledTimes(2);
+      expect(server.getTransaction).toHaveBeenCalledWith(TX_HASH);
+    });
+
+    it('fails fast when TRY_AGAIN_LATER persists across bounded retries without polling (#384)', async () => {
+      const { service, server } = createStellarHarness();
+      const signed = await signedIssueEnvelope(service);
+      jest.useFakeTimers();
+
+      server.sendTransaction.mockResolvedValue(sendTryAgainLater());
+
+      const expectation = expect(
+        service.submitSignedTransaction(signed),
+      ).rejects.toThrow(
+        /Soroban submission failed: TRY_AGAIN_LATER after 3 retries/,
+      );
+      await jest.advanceTimersByTimeAsync(10_000);
+
+      await expectation;
+      expect(server.sendTransaction).toHaveBeenCalledTimes(4);
       expect(server.getTransaction).not.toHaveBeenCalled();
     });
 

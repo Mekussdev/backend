@@ -150,6 +150,22 @@ describe('Auth flow (e2e)', () => {
       expect(body.user.email).toBe(email);
     });
 
+    it('succeeds when registering with mixed case and logging in with lowercase (#387)', async () => {
+      const mixedCaseEmail = `Ana-${randomUUID()}@${emailDomain.toUpperCase()}`;
+      await request(server())
+        .post('/v1/auth/register')
+        .send({ email: mixedCaseEmail, password, name })
+        .expect(201);
+
+      const login = await request(server())
+        .post('/v1/auth/login')
+        .send({ email: mixedCaseEmail.toLowerCase(), password })
+        .expect(200);
+
+      const body = login.body as AuthBody;
+      expect(body.user.email).toBe(mixedCaseEmail.toLowerCase());
+    });
+
     it('rejects a wrong password with 401', async () => {
       await request(server())
         .post('/v1/auth/login')

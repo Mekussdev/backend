@@ -73,6 +73,12 @@ const DEFAULT_POLL_TIMEOUT_SECONDS = 15;
 /** Interval between `getTransaction` polls while awaiting a result. */
 const POLL_INTERVAL_MS = 1_000;
 
+/** #384 — Max retry attempts when `sendTransaction` returns TRY_AGAIN_LATER. */
+const MAX_SUBMIT_RETRIES = 3;
+
+/** #384 — Initial backoff delay in ms when retrying TRY_AGAIN_LATER. */
+const INITIAL_SUBMIT_BACKOFF_MS = 1_000;
+
 @Injectable()
 export class StellarService {
   private readonly logger = new Logger(StellarService.name);
@@ -252,21 +258,55 @@ export class StellarService {
     signedXdr: string,
   ): Promise<{ result: unknown; txHash: string }> {
     const tx = TransactionBuilder.fromXDR(signedXdr, this.networkPassphrase);
-    const sendResult = await this.rpcCall(() =>
-      this.server.sendTransaction(tx),
-    );
+    const txHash = tx.hash().toString('hex');
+
+    let sendResult: rpc.Api.SendTransactionResponse | undefined;
+    let attempts = 0;
+    let delay = INITIAL_SUBMIT_BACKOFF_MS;
+
+    while (attempts <= MAX_SUBMIT_RETRIES) {
+      sendResult = await this.rpcCall(() => this.server.sendTransaction(tx));
+
+      if (sendResult.status === 'TRY_AGAIN_LATER') {
+        attempts++;
+        if (attempts <= MAX_SUBMIT_RETRIES) {
+          this.logger.warn(
+            `Soroban RPC returned TRY_AGAIN_LATER for tx ${txHash} (attempt ${attempts}/${MAX_SUBMIT_RETRIES}); retrying in ${delay}ms`,
+          );
+          await new Promise((resolve) => setTimeout(resolve, delay));
+          delay = Math.min(delay * 2, 4_000);
+          continue;
+        }
+        throw new Error(
+          `Soroban submission failed: TRY_AGAIN_LATER after ${MAX_SUBMIT_RETRIES} retries`,
+        );
+      }
+
+      break;
+    }
+
+    if (!sendResult) {
+      throw new Error('Soroban submission failed: no response from RPC');
+    }
+
     if (sendResult.status === 'ERROR') {
       throw new Error(
         `Soroban submission failed: ${JSON.stringify(sendResult.errorResult)}`,
       );
     }
 
-    const txHash = sendResult.hash;
-    const attempts = Math.ceil(
+    if (sendResult.status === 'DUPLICATE') {
+      this.logger.log(
+        `Transaction ${txHash} already submitted (DUPLICATE); polling existing hash`,
+      );
+    }
+
+    const finalHash = sendResult.hash || txHash;
+    const pollAttempts = Math.ceil(
       (this.pollTimeoutSeconds * 1000) / POLL_INTERVAL_MS,
     );
-    const returnValue = await this.pollTransaction(txHash, attempts);
-    return { result: scValToNative(returnValue), txHash };
+    const returnValue = await this.pollTransaction(finalHash, pollAttempts);
+    return { result: scValToNative(returnValue), txHash: finalHash };
   }
 
   /**
