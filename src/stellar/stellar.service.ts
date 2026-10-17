@@ -114,7 +114,8 @@ export class StellarService {
   private readonly contractId: string;
   private readonly networkPassphrase: string;
   private readonly platformSigner: Keypair;
-  private readonly buildTxTimeoutSeconds: number;
+  /** Time bound set on every `build*Tx` envelope; it can't land after this many seconds. */
+  readonly buildTxTimeoutSeconds: number;
   private readonly pollTimeoutSeconds: number;
   private readonly feeBumpMaxFeeStroops: number;
   private readonly rpcCircuitBreaker = new CircuitBreaker();
