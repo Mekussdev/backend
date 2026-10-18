@@ -154,6 +154,7 @@ the matching "confirm" endpoint accepts the signed XDR back.
 | Method & path | Purpose |
 |---|---|
 | `GET /v1/users/me` | Current user's profile |
+| `PATCH /v1/users/me` | Update the current user's display name |
 | `PATCH /v1/users/me/wallet` | Link/update the caller's Stellar public key |
 | `GET /v1/users/lookup` | Look up a user (e.g. by email) for transfers |
 
@@ -180,8 +181,9 @@ the matching "confirm" endpoint accepts the signed XDR back.
 | `GET /v1/events` | Public marketplace listing |
 | `GET /v1/events/:eventId` | Event detail |
 | `GET /v1/organizations/:organizationId/events` | Events under an organization |
-| `POST /v1/organizations/:organizationId/events` | Create a draft event |
+| `POST /v1/organizations/:organizationId/events` | Create a draft event with description, image, and venue timezone |
 | `POST /v1/events/:eventId/ticket-types` | Add a ticket type (name, price, quantity) to a draft event |
+| `PATCH /v1/events/:eventId/ticket-types/:ticketTypeId` | Update ticket inventory without dropping below issued quantity |
 | `POST /v1/events/:eventId/publish` | **build** — unsigned XDR for the on-chain `create_event` call |
 | `POST /v1/events/:eventId/confirm-publish` | **confirm** — submits the signed XDR, sets `chainEventId` and `status: PUBLISHED` |
 
@@ -191,7 +193,10 @@ the matching "confirm" endpoint accepts the signed XDR back.
 |---|---|
 | `GET /v1/tickets/mine` | Tickets the caller owns |
 | `GET /v1/tickets/resale` | Active resale listings (marketplace) |
-| `GET /v1/tickets/verify/:qrSecret` | Look up a ticket by its QR secret, for the `/verify` gate-scanner flow |
+| `GET /v1/tickets/:ticketId` | One ticket, for its owner or the event's organization staff |
+| `GET /v1/tickets/:ticketId/qr` | PNG of the ticket's QR code (owner only) |
+| `GET /v1/tickets/:ticketId/qr-token` | Short-lived signed token to show instead of the static QR secret (owner only) |
+| `GET /v1/tickets/verify/:qrSecret` | Look up a ticket by its QR secret or rotating QR token, for the `/verify` gate-scanner flow |
 | `POST /v1/tickets/issue` / `confirm-issue` | Organizer-authorized issuance (off-chain payment already settled) |
 | `POST /v1/tickets/purchase` / `confirm-purchase` | Fully on-chain primary sale |
 | `POST /v1/tickets/:ticketId/transfer` / `confirm-transfer` | Direct transfer to another user |

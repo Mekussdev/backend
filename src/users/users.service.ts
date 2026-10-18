@@ -28,6 +28,31 @@ export class UsersService {
     return user;
   }
 
+  async updateProfile(userId: string, name: string) {
+    try {
+      return await this.prisma.user.update({
+        where: { id: userId },
+        data: { name },
+        select: {
+          id: true,
+          email: true,
+          name: true,
+          role: true,
+          stellarPublicKey: true,
+          createdAt: true,
+        },
+      });
+    } catch (err) {
+      if (
+        err instanceof Prisma.PrismaClientKnownRequestError &&
+        err.code === 'P2025'
+      ) {
+        throw new NotFoundException('User not found');
+      }
+      throw err;
+    }
+  }
+
   async connectWallet(userId: string, stellarPublicKey: string) {
     try {
       const [user, ticketCount, activeListingCount] = await Promise.all([
@@ -74,8 +99,9 @@ export class UsersService {
 
   /** Used by organizers/attendees to resolve a recipient before issuing or transferring a ticket. */
   async lookupByEmail(email: string) {
+    const normalized = email.trim().toLowerCase();
     const user = await this.prisma.user.findUnique({
-      where: { email },
+      where: { email: normalized },
       select: { id: true, name: true },
     });
     if (!user) {

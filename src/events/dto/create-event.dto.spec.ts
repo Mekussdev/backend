@@ -12,8 +12,11 @@ const inMs = (offset: number) => new Date(Date.now() + offset).toISOString();
 function build(overrides: Record<string, unknown> = {}) {
   return plainToInstance(CreateEventDto, {
     name: 'Radiohead Live',
+    description: 'A live performance.',
+    imageUrl: 'https://example.com/event.jpg',
     category: 'CONCERTS',
     venue: 'Amphitheater',
+    timezone: 'Europe/London',
     startsAt: inMs(24 * 60 * 60 * 1000),
     ...overrides,
   });
@@ -30,6 +33,25 @@ describe('CreateEventDto', () => {
       build({ maxResaleMultiplierBps: 12_000, royaltyBps: 500 }),
     );
     expect(errors).toHaveLength(0);
+  });
+
+  it('accepts a null imageUrl', async () => {
+    const errors = await validate(build({ imageUrl: null }));
+    expect(errors).toHaveLength(0);
+  });
+
+  it('rejects an invalid imageUrl', async () => {
+    const errors = await validate(build({ imageUrl: 'not-a-url' }));
+    expect(errors.some((e) => e.property === 'imageUrl')).toBe(true);
+  });
+
+  it('accepts a valid IANA timezone and rejects an invalid one', async () => {
+    await expect(
+      validate(build({ timezone: 'Africa/Lagos' })),
+    ).resolves.toHaveLength(0);
+
+    const errors = await validate(build({ timezone: 'Mars/Olympus_Mons' }));
+    expect(errors.some((e) => e.property === 'timezone')).toBe(true);
   });
 
   it('rejects a maxResaleMultiplierBps below 100% (would be a discount, not a cap)', async () => {
@@ -101,6 +123,54 @@ describe('CreateEventDto', () => {
       build({ ticketTypes: [{ price: '1000', quantityTotal: 100 }] }),
     );
     expect(errors.some((e) => e.property === 'ticketTypes')).toBe(true);
+  });
+
+  describe('royaltyBps and maxResaleMultiplierBps (#97)', () => {
+    it('accepts royaltyBps at the minimum boundary (0)', async () => {
+      const errors = await validate(build({ royaltyBps: 0 }));
+      expect(errors).toHaveLength(0);
+    });
+
+    it('accepts royaltyBps at the maximum boundary (2000 bps = 20%)', async () => {
+      const errors = await validate(build({ royaltyBps: 2_000 }));
+      expect(errors).toHaveLength(0);
+    });
+
+    it('rejects a negative royaltyBps', async () => {
+      const errors = await validate(build({ royaltyBps: -1 }));
+      expect(errors.some((e) => e.property === 'royaltyBps')).toBe(true);
+    });
+
+    it('accepts maxResaleMultiplierBps at the minimum boundary (10000 bps = 100%)', async () => {
+      const errors = await validate(build({ maxResaleMultiplierBps: 10_000 }));
+      expect(errors).toHaveLength(0);
+    });
+
+    it('accepts maxResaleMultiplierBps at the maximum boundary (50000 bps = 500%)', async () => {
+      const errors = await validate(build({ maxResaleMultiplierBps: 50_000 }));
+      expect(errors).toHaveLength(0);
+    });
+
+    it('rejects maxResaleMultiplierBps above 50000 bps', async () => {
+      const errors = await validate(build({ maxResaleMultiplierBps: 50_001 }));
+      expect(errors.some((e) => e.property === 'maxResaleMultiplierBps')).toBe(
+        true,
+      );
+    });
+
+    it('rejects a non-integer royaltyBps', async () => {
+      const errors = await validate(build({ royaltyBps: 1.5 }));
+      expect(errors.some((e) => e.property === 'royaltyBps')).toBe(true);
+    });
+
+    it('rejects a non-integer maxResaleMultiplierBps', async () => {
+      const errors = await validate(
+        build({ maxResaleMultiplierBps: 10_000.5 }),
+      );
+      expect(errors.some((e) => e.property === 'maxResaleMultiplierBps')).toBe(
+        true,
+      );
+    });
   });
 
   describe('max length (#400)', () => {

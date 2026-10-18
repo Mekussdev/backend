@@ -1,5 +1,6 @@
 import { HEADERS_METADATA } from '@nestjs/common/constants';
 import {
+  ConflictException,
   ForbiddenException,
   INestApplication,
   NotFoundException,
@@ -14,16 +15,19 @@ import {
 import { EventsController } from './events.controller';
 import { EventsService } from './events.service';
 import { ResponseCacheInterceptor } from '../common/interceptors/response-cache.interceptor';
+import { OptionalJwtAuthGuard } from '../auth/guards/optional-jwt-auth.guard';
 
 describe('EventsController', () => {
   let app: INestApplication;
   const service = {
     findPublished: jest.fn(),
     getWithOrg: jest.fn(),
+    getWithReconciliation: jest.fn(),
     findForOrganization: jest.fn(),
     summarizeForOrganization: jest.fn(),
     create: jest.fn(),
     addTicketType: jest.fn(),
+    updateTicketType: jest.fn(),
     buildPublishTx: jest.fn(),
     unpublish: jest.fn(),
     confirmPublish: jest.fn(),
@@ -35,7 +39,10 @@ describe('EventsController', () => {
     app = await createControllerApp({
       controller: EventsController,
       service: { provide: EventsService, useValue: service },
-      passthrough: { interceptors: [ResponseCacheInterceptor] },
+      passthrough: {
+        guards: [OptionalJwtAuthGuard],
+        interceptors: [ResponseCacheInterceptor],
+      },
     });
   });
   afterAll(() => app.close());
@@ -73,16 +80,79 @@ describe('EventsController', () => {
       );
     });
 
-    it('GET /events/:eventId returns one event and propagates not-found', async () => {
-      service.getWithOrg.mockResolvedValueOnce({ id: 'e1' });
-      await http().get('/events/e1').expect(200);
-      expect(service.getWithOrg).toHaveBeenCalledWith('e1');
+    it('GET /events passes validated search filters to the service', async () => {
+      service.findPublished.mockResolvedValue([[], 0]);
+      await http()
+        .get('/events')
+        .query({
+          q: ' jazz ',
+          category: 'CONCERTS',
+          from: '2026-11-01T00:00:00.000Z',
+          to: '2026-11-30T00:00:00.000Z',
+        })
+        .expect(200);
+      expect(service.findPublished).toHaveBeenCalledWith(
+        expect.objectContaining({
+          q: 'jazz',
+          category: 'CONCERTS',
+          from: new Date('2026-11-01T00:00:00.000Z'),
+          to: new Date('2026-11-30T00:00:00.000Z'),
+        }),
+      );
+    });
 
-      service.getWithOrg.mockRejectedValueOnce(
+    it.each([
+      [{ category: 'PARTIES' }],
+      [{ from: 'soon' }],
+      [{ from: '2026-11-02', to: '2026-11-01' }],
+      [{ q: 'a'.repeat(101) }],
+      [{ venue: 'Fillmore' }],
+    ])('GET /events rejects invalid filters %j', async (query) => {
+      await http().get('/events').query(query).expect(400);
+      expect(service.findPublished).not.toHaveBeenCalled();
+    });
+
+    it('GET /events/:eventId returns one event and propagates not-found', async () => {
+      service.getWithReconciliation.mockResolvedValueOnce({ id: 'e1' });
+      await http().get('/events/e1').expect(200);
+      expect(service.getWithReconciliation).toHaveBeenCalledWith(
+        'e1',
+        false,
+        undefined,
+      );
+
+      service.getWithReconciliation.mockRejectedValueOnce(
         new NotFoundException('Event not found'),
       );
       const res = await http().get('/events/nope').expect(404);
       expect((res.body as { message: string }).message).toBe('Event not found');
+    });
+
+    it('GET /events/:eventId forwards the reconcile flag', async () => {
+      service.getWithReconciliation.mockResolvedValueOnce({ id: 'e1' });
+
+      await http().get('/events/e1?reconcile=true').expect(200);
+
+      expect(service.getWithReconciliation).toHaveBeenCalledWith(
+        'e1',
+        true,
+        undefined,
+      );
+    });
+
+    it('forwards the caller id so members can see their drafts (#372)', async () => {
+      const controller = new EventsController(
+        service as unknown as EventsService,
+      );
+      service.getWithReconciliation.mockClear();
+
+      await controller.findOne('e1', { ...TEST_USER }, undefined);
+
+      expect(service.getWithReconciliation).toHaveBeenCalledWith(
+        'e1',
+        false,
+        TEST_USER.userId,
+      );
     });
   });
 
@@ -91,6 +161,7 @@ describe('EventsController', () => {
       ['get', '/organizations/o1/events'],
       ['post', '/organizations/o1/events'],
       ['post', '/events/e1/ticket-types'],
+      ['patch', '/events/e1/ticket-types/t1'],
       ['post', '/events/e1/publish'],
       ['post', '/events/e1/unpublish'],
       ['post', '/events/e1/confirm-publish'],
@@ -166,8 +237,11 @@ describe('EventsController', () => {
     describe('POST /organizations/:organizationId/events', () => {
       const body = {
         name: 'Concert',
+        description: 'An evening concert.',
+        imageUrl: 'https://example.com/concert.jpg',
         category: 'CONCERTS',
         venue: 'Main Hall',
+        timezone: 'Africa/Lagos',
         startsAt: new Date(Date.now() + 86_400_000).toISOString(),
       };
 
@@ -190,6 +264,8 @@ describe('EventsController', () => {
         ['an unknown category', { category: 'NOPE' }],
         ['a start date in the past', { startsAt: '2020-01-01T00:00:00.000Z' }],
         ['an out-of-range royalty', { royaltyBps: 5000 }],
+        ['an invalid image URL', { imageUrl: 'not-a-url' }],
+        ['an invalid timezone', { timezone: 'Lagos' }],
         ['an unknown field', { bogus: true }],
       ])('rejects %s', async (_label, patch) => {
         await http()
@@ -242,6 +318,51 @@ describe('EventsController', () => {
       });
     });
 
+    describe('PATCH /events/:eventId/ticket-types/:ticketTypeId', () => {
+      it('updates total inventory for the caller', async () => {
+        service.updateTicketType.mockResolvedValue({
+          id: 't1',
+          quantityTotal: 75,
+        });
+
+        await http()
+          .patch('/events/e1/ticket-types/t1')
+          .set(AUTH)
+          .send({ quantityTotal: 75 })
+          .expect(200);
+
+        expect(service.updateTicketType).toHaveBeenCalledWith(
+          TEST_USER.userId,
+          'e1',
+          't1',
+          expect.objectContaining({ quantityTotal: 75 }),
+        );
+      });
+
+      it('rejects invalid totals and propagates inventory conflicts', async () => {
+        await http()
+          .patch('/events/e1/ticket-types/t1')
+          .set(AUTH)
+          .send({ quantityTotal: 0 })
+          .expect(400);
+        expect(service.updateTicketType).not.toHaveBeenCalled();
+
+        service.updateTicketType.mockRejectedValue(
+          new ConflictException(
+            'quantityTotal cannot be lower than quantityIssued',
+          ),
+        );
+        const res = await http()
+          .patch('/events/e1/ticket-types/t1')
+          .set(AUTH)
+          .send({ quantityTotal: 9 })
+          .expect(409);
+        expect((res.body as { message: string }).message).toBe(
+          'quantityTotal cannot be lower than quantityIssued',
+        );
+      });
+    });
+
     it('POST /events/:eventId/publish builds the publish transaction', async () => {
       service.buildPublishTx.mockResolvedValue({ xdr: 'x' });
       const res = await http().post('/events/e1/publish').set(AUTH).expect(201);
@@ -267,12 +388,12 @@ describe('EventsController', () => {
         await http()
           .post('/events/e1/confirm-publish')
           .set(AUTH)
-          .send({ signedXdr: 'signed', txHash: 'a'.repeat(64) })
+          .send({ signedXdr: 'AAAA', txHash: 'a'.repeat(64) })
           .expect(201);
         expect(service.confirmPublish).toHaveBeenCalledWith(
           TEST_USER.userId,
           'e1',
-          'signed',
+          'AAAA',
         );
       });
 

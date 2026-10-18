@@ -5,21 +5,24 @@ import {
   Get,
   Header,
   Param,
+  Patch,
   Post,
   Query,
   UseGuards,
   UseInterceptors,
 } from '@nestjs/common';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
+import { OptionalJwtAuthGuard } from '../auth/guards/optional-jwt-auth.guard';
 import { CurrentUser } from '../auth/decorators/current-user.decorator';
 import type { CurrentUserPayload } from '../auth/decorators/current-user.decorator';
 import { EventsService } from './events.service';
 import { CreateEventDto } from './dto/create-event.dto';
 import { CreateTicketTypeDto } from './dto/create-ticket-type.dto';
+import { UpdateTicketTypeDto } from './dto/update-ticket-type.dto';
 import { ConfirmPublishDto } from './dto/confirm-publish.dto';
-import { PaginationQueryDto } from '../common/dto/pagination-query.dto';
 import { PaginatedResponseInterceptor } from '../common/interceptors/paginated-response.interceptor';
 import { ListOrganizationEventsQueryDto } from './dto/list-organization-events-query.dto';
+import { ListPublishedEventsQueryDto } from './dto/list-published-events-query.dto';
 import { ResponseCacheInterceptor } from '../common/interceptors/response-cache.interceptor';
 
 @Controller()
@@ -30,19 +33,22 @@ export class EventsController {
   @Header('Cache-Control', 'public, max-age=60, s-maxage=300')
   // The cache wraps the paginator so it stores the finished page body.
   @UseInterceptors(ResponseCacheInterceptor, PaginatedResponseInterceptor)
-  findPublished(@Query() query: PaginationQueryDto) {
+  findPublished(@Query() query: ListPublishedEventsQueryDto) {
     return this.eventsService.findPublished(query);
   }
 
   @Get('events/:eventId')
+  @UseGuards(OptionalJwtAuthGuard)
   @UseInterceptors(ResponseCacheInterceptor)
   findOne(
     @Param('eventId') eventId: string,
+    @CurrentUser() user: CurrentUserPayload | undefined,
     @Query('reconcile') reconcile?: string,
   ) {
     return this.eventsService.getWithReconciliation(
       eventId,
       reconcile === 'true',
+      user?.userId,
     );
   }
 
@@ -90,6 +96,22 @@ export class EventsController {
     @Body() dto: CreateTicketTypeDto,
   ) {
     return this.eventsService.addTicketType(user.userId, eventId, dto);
+  }
+
+  @Patch('events/:eventId/ticket-types/:ticketTypeId')
+  @UseGuards(JwtAuthGuard)
+  updateTicketType(
+    @CurrentUser() user: CurrentUserPayload,
+    @Param('eventId') eventId: string,
+    @Param('ticketTypeId') ticketTypeId: string,
+    @Body() dto: UpdateTicketTypeDto,
+  ) {
+    return this.eventsService.updateTicketType(
+      user.userId,
+      eventId,
+      ticketTypeId,
+      dto,
+    );
   }
 
   @Post('events/:eventId/publish')

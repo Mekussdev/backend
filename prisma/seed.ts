@@ -92,9 +92,12 @@ async function main() {
       data: {
         organizationId: org.id,
         name: 'StellarFest 2027',
+        description: 'A demo concert powered by StellarTickets.',
+        imageUrl: null,
         category: Industry.CONCERTS,
         status: EventStatus.PUBLISHED,
         venue: 'The Stellar Arena, Cape Town',
+        timezone: 'Africa/Johannesburg',
         startsAt: new Date('2027-03-15T19:00:00Z'),
         endsAt: new Date('2027-03-15T23:00:00Z'),
       },

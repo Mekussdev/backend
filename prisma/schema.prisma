@@ -54,6 +54,22 @@ enum TicketStatus {
   RESALE
 }
 
+/// Off-chain record of a primary-sale refund for a REVOKED ticket (#141).
+/// The chain has no refund concept; this tracks the admin-driven payout.
+enum RefundStatus {
+  PENDING
+  COMPLETED
+}
+
+model Refund {
+  id          String       @id @default(uuid())
+  ticket      Ticket       @relation(fields: [ticketId], references: [id])
+  ticketId    String       @unique
+  status      RefundStatus @default(PENDING)
+  createdAt   DateTime     @default(now())
+  completedAt DateTime?
+}
+
 enum ResaleListingStatus {
   ACTIVE
   SOLD
@@ -91,6 +107,8 @@ model User {
   promoRedemptions PromoCodeRedemption[]
   auditLogs        AuditLog[]
   pendingTxs       PendingTx[]
+  sentInvitations     OrganizationInvitation[] @relation("InvitationInviter")
+  acceptedInvitations OrganizationInvitation[] @relation("InvitationAcceptor")
   createdAt        DateTime             @default(now())
   updatedAt        DateTime             @updatedAt
 }
@@ -111,6 +129,7 @@ model Organization {
   /// Default `Event.royaltyBps` applied when a new event's DTO omits it.
   defaultRoyaltyBps             Int @default(500)
   members        OrganizationMember[]
+  invitations    OrganizationInvitation[]
   events         Event[]
   webhookEndpoints WebhookEndpoint[]
   /// #207 — soft-delete marker. Null = live; non-null = deleted at that time.
@@ -133,18 +152,49 @@ model OrganizationMember {
   @@index([userId])
 }
 
+/// An invite for an email address to join an `Organization`, so members can be
+/// added before they have an account. Only a SHA-256 hash of the opaque token
+/// is stored; the raw token is returned once at creation. Accepting creates
+/// the `OrganizationMember`; invites expire 7 days after creation.
+model OrganizationInvitation {
+  id             String        @id @default(uuid())
+  organization   Organization  @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  organizationId String
+  /// Stored trimmed and lower-cased, matching `User.email`.
+  email          String
+  role           OrgMemberRole @default(STAFF)
+  tokenHash      String        @unique
+  invitedBy      User?         @relation("InvitationInviter", fields: [invitedById], references: [id], onDelete: SetNull)
+  invitedById    String?
+  expiresAt      DateTime
+  acceptedAt     DateTime?
+  acceptedBy     User?         @relation("InvitationAcceptor", fields: [acceptedById], references: [id], onDelete: SetNull)
+  acceptedById   String?
+  createdAt      DateTime      @default(now())
+
+  @@index([organizationId, email])
+}
+
 model Event {
   id                     String          @id @default(uuid())
   organization           Organization    @relation(fields: [organizationId], references: [id], onDelete: Cascade)
   organizationId         String
   name                   String
+  description            String
+  imageUrl               String?
   category               Industry
   venue                  String
+  /// IANA time-zone identifier used to display UTC timestamps at the venue.
+  timezone               String
   startsAt               DateTime
   endsAt                 DateTime?
   /// The `event_id` (u64) this event was registered under on the ticketing
   /// contract via `create_event`. Null until the on-chain call succeeds.
   chainEventId           BigInt?         @unique
+  /// #381 — when `chainEventId` was last reserved by a publish build. An
+  /// unconfirmed reservation expires with its envelope's time bound and is
+  /// then reused by the next publish attempt.
+  chainEventIdReservedAt DateTime?
   publishedTxHash        String?
   maxResaleMultiplierBps Int             @default(11000)
   royaltyBps             Int             @default(500)
@@ -161,6 +211,8 @@ model Event {
   updatedAt              DateTime        @updatedAt
 
   @@index([organizationId])
+  @@index([status, startsAt])
+  @@index([status, category, startsAt])
 }
 
 model TicketType {
@@ -210,6 +262,7 @@ model Ticket {
   checkedInGateId String?
   resaleListings ResaleListing[]
   promoRedemption PromoCodeRedemption?
+  refund         Refund?
   createdAt      DateTime        @default(now())
   updatedAt      DateTime        @updatedAt
 
@@ -412,4 +465,31 @@ model PendingTx {
 
   @@index([expiresAt])
   @@index([userId])
+}
+
+/// Signed transactions already relayed and recorded by a confirm-* endpoint,
+/// keyed by the envelope hash (#159). A replayed confirm returns `response`
+/// instead of re-applying the DB changes.
+model ProcessedTx {
+  txHash    String   @id
+  operation String
+  response  Json
+  createdAt DateTime @default(now())
+}
+
+/// Position of the chain event indexer in the ticketing contract's event
+/// stream (#163). `cursor` is the RPC `pagingToken` of the last applied event.
+model IndexerCursor {
+  name      String   @id
+  cursor    String
+  updatedAt DateTime @updatedAt
+}
+
+/// Contract events the indexer already applied, keyed by the RPC event id
+/// (#163). A re-delivered event hits this primary key and is skipped.
+model ProcessedChainEvent {
+  id          String   @id
+  ledger      Int
+  name        String
+  processedAt DateTime @default(now())
 }

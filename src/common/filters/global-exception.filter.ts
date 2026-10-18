@@ -30,15 +30,35 @@ export class GlobalExceptionFilter implements ExceptionFilter {
     const response = ctx.getResponse<Response>();
     const request = ctx.getRequest<Request>();
 
+    const rawRequestId =
+      request?.headers?.['x-request-id'] ??
+      (request as unknown as { id?: string })?.id ??
+      (response?.getHeader?.('x-request-id') as string | undefined);
+    const requestId =
+      typeof rawRequestId === 'string'
+        ? rawRequestId
+        : Array.isArray(rawRequestId)
+          ? rawRequestId[0]
+          : undefined;
+
     // HttpExceptions (404s, 403s, ValidationPipe 400s, ...) already carry
     // their status and body. Forward them unchanged so clients keep Nest's
     // `{ statusCode, message, error }` shape instead of a generic 500.
     if (exception instanceof HttpException) {
       const statusCode = exception.getStatus();
       const body = exception.getResponse();
-      response
-        .status(statusCode)
-        .json(typeof body === 'string' ? { statusCode, message: body } : body);
+      let responseBody: Record<string, unknown>;
+      if (typeof body === 'string') {
+        responseBody = { statusCode, message: body };
+      } else if (typeof body === 'object' && body !== null) {
+        responseBody = { ...(body as Record<string, unknown>) };
+      } else {
+        responseBody = { statusCode, message: String(body) };
+      }
+      if (requestId && responseBody.requestId === undefined) {
+        responseBody.requestId = requestId;
+      }
+      response.status(statusCode).json(responseBody);
       return;
     }
 
@@ -67,13 +87,15 @@ export class GlobalExceptionFilter implements ExceptionFilter {
       code = 'PRISMA_INITIALIZATION_ERROR';
       message = 'Database connection failed';
     } else if (exception instanceof Error) {
+      const prefix = requestId ? `[${requestId}] ` : '';
       this.logger.error(
-        `Unhandled exception: ${exception.message}`,
+        `${prefix}Unhandled exception: ${exception.message}`,
         exception.stack,
         `${request.method} ${request.url}`,
       );
     }
 
+ fix/issues-395-396-397-398-runtime-hardening
     const responseBody = {
       statusCode,
       code,
@@ -89,6 +111,18 @@ export class GlobalExceptionFilter implements ExceptionFilter {
   private getRequestId(request: Request): string {
     const header = request.headers['x-request-id'];
     return (Array.isArray(header) ? header[0] : header) ?? randomUUID();
+
+    const errorBody: Record<string, unknown> = {
+      statusCode,
+      code,
+      message,
+    };
+    if (requestId) {
+      errorBody.requestId = requestId;
+    }
+
+    response.status(statusCode).json(errorBody);
+ main
   }
 
   private getPrismaErrorMessage(

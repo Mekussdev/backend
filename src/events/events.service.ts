@@ -6,35 +6,60 @@ import {
   NotFoundException,
   Optional,
 } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { EventStatus, Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { OrganizationsService } from '../organizations/organizations.service';
 import { StellarService } from '../stellar/stellar.service';
 import { AuditService } from '../audit/audit.service';
-import {
-  DEFAULT_PAGE_LIMIT,
-  PaginationQueryDto,
-} from '../common/dto/pagination-query.dto';
+import { DEFAULT_PAGE_LIMIT } from '../common/dto/pagination-query.dto';
 import { toSkipTake } from '../common/pagination/paginated';
 import { CreateEventDto } from './dto/create-event.dto';
+import { ListPublishedEventsQueryDto } from './dto/list-published-events-query.dto';
 import { CreateTicketTypeDto } from './dto/create-ticket-type.dto';
+import { UpdateTicketTypeDto } from './dto/update-ticket-type.dto';
 import { CACHE_STORE } from '../common/cache/cache-store';
 import { Inject } from '@nestjs/common';
+import { formatPrice } from '../common/utils/currency';
+import { getSettlementAsset } from '../config/settlement-asset';
+import type { SettlementAsset } from '../config/settlement-asset';
 
 /** On-chain existence derived from `StellarService.getEvent`, reported alongside the cached DB `status` when reconciliation is requested. */
-export type OnChainReconciliationStatus = 'PUBLISHED' | 'NOT_FOUND' | 'NOT_PUBLISHED';
+export type OnChainReconciliationStatus =
+  'PUBLISHED' | 'NOT_FOUND' | 'NOT_PUBLISHED';
+
+function hasPricedTicketTypes<T extends object>(
+  event: T,
+): event is T & { ticketTypes: Array<{ price: bigint }> } {
+  return (
+    'ticketTypes' in event &&
+    Array.isArray(event.ticketTypes) &&
+    event.ticketTypes.every(
+      (ticketType: unknown) =>
+        typeof ticketType === 'object' &&
+        ticketType !== null &&
+        'price' in ticketType &&
+        typeof ticketType.price === 'bigint',
+    )
+  );
+}
 
 @Injectable()
 export class EventsService {
+  private readonly settlementAsset: SettlementAsset;
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly organizations: OrganizationsService,
     private readonly stellar: StellarService,
+    config: ConfigService,
     @Optional() private readonly audit?: AuditService,
     @Optional()
     @Inject(CACHE_STORE)
     private readonly cache?: { delete(k: string): Promise<void> },
-  ) {}
+  ) {
+    this.settlementAsset = getSettlementAsset(config);
+  }
 
   async create(userId: string, organizationId: string, dto: CreateEventDto) {
     await this.organizations.assertMember(organizationId, userId);
@@ -45,8 +70,11 @@ export class EventsService {
         data: {
           organizationId,
           name: dto.name,
+          description: dto.description,
+          imageUrl: dto.imageUrl,
           category: dto.category,
           venue: dto.venue,
+          timezone: dto.timezone,
           startsAt: dto.startsAt,
           endsAt: dto.endsAt,
           maxResaleMultiplierBps:
@@ -76,7 +104,7 @@ export class EventsService {
       organizationId,
     });
     await this.invalidateCache();
-    return event;
+    return this.withEventPricing(event);
   }
 
   async addTicketType(
@@ -86,6 +114,13 @@ export class EventsService {
   ) {
     const event = await this.getWithOrg(eventId);
     await this.organizations.assertMember(event.organizationId, userId);
+    // #371 — once published, the event's sellable inventory is mirrored
+    // on-chain; adding a ticket type here would drift the two apart.
+    if (event.status !== EventStatus.DRAFT) {
+      throw new BadRequestException(
+        'Ticket types can only be added to draft events',
+      );
+    }
     if (
       dto.saleStartsAt &&
       dto.saleEndsAt &&
@@ -93,7 +128,7 @@ export class EventsService {
     ) {
       throw new BadRequestException('Ticket sale end must be after its start');
     }
-    return this.prisma.ticketType.create({
+    const ticketType = await this.prisma.ticketType.create({
       data: {
         eventId,
         name: dto.name,
@@ -104,6 +139,48 @@ export class EventsService {
         isHidden: dto.isHidden ?? false,
       },
     });
+    return this.withTicketTypePricing(ticketType);
+  }
+
+  async updateTicketType(
+    userId: string,
+    eventId: string,
+    ticketTypeId: string,
+    dto: UpdateTicketTypeDto,
+  ) {
+    const ticketType = await this.prisma.ticketType.findFirst({
+      where: { id: ticketTypeId, eventId },
+      include: { event: { select: { organizationId: true } } },
+    });
+    if (!ticketType) {
+      throw new NotFoundException('Ticket type not found');
+    }
+    await this.organizations.assertMember(
+      ticketType.event.organizationId,
+      userId,
+    );
+
+    // Keep the comparison and write in one statement so concurrent issuance
+    // cannot make quantityTotal smaller than quantityIssued between them.
+    const { count } = await this.prisma.ticketType.updateMany({
+      where: {
+        id: ticketTypeId,
+        eventId,
+        quantityIssued: { lte: dto.quantityTotal },
+      },
+      data: { quantityTotal: dto.quantityTotal },
+    });
+    if (count === 0) {
+      throw new ConflictException(
+        'quantityTotal cannot be lower than quantityIssued',
+      );
+    }
+
+    const updated = await this.prisma.ticketType.findUniqueOrThrow({
+      where: { id: ticketTypeId },
+    });
+    await this.invalidateCache();
+    return this.withTicketTypePricing(updated);
   }
 
   /** Step 1 of publishing: returns an unsigned XDR for the organizer's wallet to sign. */
@@ -116,7 +193,8 @@ export class EventsService {
     if (event.status !== EventStatus.DRAFT) {
       throw new BadRequestException('Only draft events can be published');
     }
-    if (event.chainEventId !== null) {
+    // #381 — an expired, unconfirmed reservation no longer blocks publishing.
+    if (event.publishedTxHash !== null || this.hasPendingReservation(event)) {
       throw new BadRequestException(
         'This event already has a pending or confirmed on-chain id',
       );
@@ -131,7 +209,7 @@ export class EventsService {
       );
     }
 
-    const chainEventId = await this.reserveChainEventId(eventId);
+    const chainEventId = await this.reserveChainEventId(event);
     const unsignedXdr = await this.stellar.buildCreateEventTx({
       organizerPublicKey: event.organization.stellarAccount,
       chainEventId,
@@ -147,6 +225,11 @@ export class EventsService {
   async confirmPublish(userId: string, eventId: string, signedXdr: string) {
     const event = await this.getWithOrg(eventId);
     await this.organizations.assertMember(event.organizationId, userId);
+    // #382 — refuse before any network call, so a published event can't
+    // relay a second `create_event` or have its status rewritten.
+    if (event.status !== EventStatus.DRAFT) {
+      throw new ConflictException('Only draft events can be published');
+    }
     if (event.chainEventId === null) {
       throw new BadRequestException('Call publish before confirm-publish');
     }
@@ -215,13 +298,45 @@ export class EventsService {
     return event;
   }
 
-  /** Looks up the event, optionally reconciling its cached DB `status` against the chain. */
-  async getWithReconciliation(eventId: string, reconcile: boolean) {
+  /**
+   * Looks up the event for a possibly-anonymous `viewerId`, optionally
+   * reconciling its cached DB `status` against the chain.
+   *
+   * #372 — only PUBLISHED events are public. Drafts (and any other
+   * non-published status) read as not-found to anonymous callers and to
+   * authenticated callers who are not members of the owning organization, so
+   * an unannounced event's existence isn't leaked by its UUID.
+   */
+  async getWithReconciliation(
+    eventId: string,
+    reconcile: boolean,
+    viewerId?: string,
+  ) {
     const event = await this.getWithOrg(eventId);
-    if (!reconcile) {
-      return event;
+    if (
+      event.status !== EventStatus.PUBLISHED &&
+      !(await this.canView(event, viewerId))
+    ) {
+      throw new NotFoundException('Event not found');
     }
-    return { ...event, onChainStatus: await this.getOnChainStatus(event) };
+    if (!reconcile) {
+      return this.withEventPricing(event);
+    }
+    return this.withEventPricing({
+      ...event,
+      onChainStatus: await this.getOnChainStatus(event),
+    });
+  }
+
+  /** A viewer may see a non-published event only if they belong to its organization. */
+  private async canView(
+    event: { organizationId: string },
+    viewerId?: string,
+  ): Promise<boolean> {
+    if (!viewerId) {
+      return false;
+    }
+    return this.organizations.isMember(event.organizationId, viewerId);
   }
 
   private async getOnChainStatus(event: {
@@ -239,14 +354,29 @@ export class EventsService {
   }
 
   /** One page of published events plus the total count, for `GET /events`. */
-  findPublished(query: PaginationQueryDto) {
+  async findPublished(query: ListPublishedEventsQueryDto) {
     // #207 — exclude soft-deleted events and events of soft-deleted orgs.
-    const where = {
+    // Optional filters are ANDed on; `status`/`category`/`startsAt` are
+    // covered by the `Event_status_category_startsAt_idx` index.
+    const where: Prisma.EventWhereInput = {
       status: EventStatus.PUBLISHED,
       deletedAt: null,
       organization: { deletedAt: null },
+      ...(query.category && { category: query.category }),
+      ...((query.from || query.to) && {
+        startsAt: {
+          ...(query.from && { gte: query.from }),
+          ...(query.to && { lte: query.to }),
+        },
+      }),
+      ...(query.q && {
+        OR: [
+          { name: { contains: query.q, mode: 'insensitive' } },
+          { venue: { contains: query.q, mode: 'insensitive' } },
+        ],
+      }),
     };
-    return this.prisma.$transaction([
+    const [events, total] = await this.prisma.$transaction([
       this.prisma.event.findMany({
         where,
         include: {
@@ -260,6 +390,10 @@ export class EventsService {
       }),
       this.prisma.event.count({ where }),
     ]);
+    return [
+      events.map((event) => this.withEventPricing(event)),
+      total,
+    ] as const;
   }
 
   /** #207 — soft-delete: sets `deletedAt` instead of hard-deleting. */
@@ -323,7 +457,39 @@ export class EventsService {
       this.prisma.event.count({ where }),
     ]);
 
-    return { items, total, page, limit };
+    return {
+      items: items.map((event) => this.withEventPricing(event)),
+      total,
+      page,
+      limit,
+    };
+  }
+
+  private withEventPricing<T extends object>(event: T) {
+    if ('ticketTypes' in event) {
+      if (!hasPricedTicketTypes(event)) {
+        throw new TypeError('Event ticket types must include bigint prices');
+      }
+      return {
+        ...event,
+        settlementAsset: this.settlementAsset,
+        ticketTypes: event.ticketTypes.map((ticketType) =>
+          this.withTicketTypePricing(ticketType),
+        ),
+      };
+    }
+
+    return {
+      ...event,
+      settlementAsset: this.settlementAsset,
+    };
+  }
+
+  private withTicketTypePricing<T extends { price: bigint }>(ticketType: T) {
+    return {
+      ...ticketType,
+      priceDisplay: `${formatPrice(ticketType.price, this.settlementAsset.decimals)} ${this.settlementAsset.code}`,
+    };
   }
 
   /** Event counts per status for one organization, for `GET .../events/summary`. */
@@ -348,14 +514,50 @@ export class EventsService {
     return { total, byStatus };
   }
 
-  /** Picks a random u64 (well within Postgres's signed-bigint range) and reserves it on the event row. */
-  private async reserveChainEventId(eventId: string): Promise<bigint> {
+  /**
+   * #381 — a reservation is pending while the envelope built for it is
+   * inside its time bound (`StellarService.buildTxTimeoutSeconds`). After
+   * that the network rejects the envelope (`txTOO_LATE`), so it can never
+   * land and the reservation is free to take over.
+   */
+  private hasPendingReservation(event: {
+    chainEventId: bigint | null;
+    chainEventIdReservedAt: Date | null;
+  }): boolean {
+    if (event.chainEventId === null || event.chainEventIdReservedAt === null) {
+      return false;
+    }
+    const expiresAt =
+      event.chainEventIdReservedAt.getTime() +
+      this.stellar.buildTxTimeoutSeconds * 1000;
+    return Date.now() < expiresAt;
+  }
+
+  /**
+   * Reserves the event's on-chain id and stamps the reservation time. An
+   * abandoned reservation (#381) is reused rather than replaced: the
+   * contract rejects a second `create_event` for one id
+   * (`EventAlreadyExists`), so reuse can never register the event twice.
+   * Otherwise picks a random u64 (well within Postgres's signed-bigint range).
+   */
+  private async reserveChainEventId(event: {
+    id: string;
+    chainEventId: bigint | null;
+  }): Promise<bigint> {
+    const chainEventIdReservedAt = new Date();
+    if (event.chainEventId !== null) {
+      await this.prisma.event.update({
+        where: { id: event.id },
+        data: { chainEventIdReservedAt },
+      });
+      return event.chainEventId;
+    }
     for (let attempt = 0; attempt < 5; attempt++) {
       const candidate = randomBytes(6).readUIntBE(0, 6); // 48 bits — Buffer#readUIntBE caps at 6 bytes
       try {
         await this.prisma.event.update({
-          where: { id: eventId },
-          data: { chainEventId: BigInt(candidate) },
+          where: { id: event.id },
+          data: { chainEventId: BigInt(candidate), chainEventIdReservedAt },
         });
         return BigInt(candidate);
       } catch (err) {
